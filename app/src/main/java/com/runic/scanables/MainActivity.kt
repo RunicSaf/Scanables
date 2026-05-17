@@ -1,11 +1,17 @@
 package com.runic.scanables
 
 import android.Manifest
+import android.content.ContentValues
+import android.content.Intent
 import android.app.Activity
 import android.content.Context
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
+import android.net.Uri
+import android.widget.Toast
 import android.os.Bundle
+import android.os.Environment
+import android.provider.MediaStore
 import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
@@ -25,6 +31,7 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.gestures.scrollBy
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -46,6 +53,7 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.ArrowBack
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.ExpandLess
@@ -54,6 +62,7 @@ import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.QrCodeScanner
 import androidx.compose.material.icons.filled.Star
+import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.outlined.StarBorder
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.AssistChip
@@ -92,13 +101,18 @@ import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.draw.alpha
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.boundsInRoot
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalLifecycleOwner
+import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardCapitalization
 import androidx.compose.ui.text.style.TextOverflow
@@ -155,6 +169,18 @@ data class DragPreviewState(
     val showFavouriteRemoveWarning: Boolean = false
 )
 
+data class ImportedScanable(
+    val item: ScanableItem,
+    val categoryName: String? = null
+)
+
+data class ScanablesBackup(
+    val items: List<ScanableItem>,
+    val categories: List<ScanableCategory>,
+    val favouritesCollapsed: Boolean,
+    val uncategorizedCollapsed: Boolean
+)
+
 enum class ScanableFormat {
     QR_CODE,
     CODE_128,
@@ -173,6 +199,9 @@ private const val KEY_CATEGORIES = "categories_json"
 private const val KEY_FAV_COLLAPSED = "favourites_collapsed"
 private const val KEY_UNCAT_COLLAPSED = "uncategorized_collapsed"
 private const val KEY_SWIPE_TUTORIAL_SEEN = "swipe_tutorial_seen"
+private const val KEY_ONBOARDING_COMPLETE = "onboarding_complete"
+private const val JSON_TYPE_BACKUP = "scanables_backup_v1"
+private const val JSON_TYPE_SCANABLE = "scanables_item_v1"
 
 @Composable
 fun ScanablesApp() {
@@ -192,6 +221,7 @@ fun ScanablesApp() {
     var categoryBeingEdited by remember { mutableStateOf<ScanableCategory?>(null) }
 
     var showSwipeTutorial by remember { mutableStateOf(false) }
+    var sharingItem by remember { mutableStateOf<ScanableItem?>(null) }
 
     LaunchedEffect(Unit) {
         val store = ScanablesStore(context)
@@ -211,6 +241,106 @@ fun ScanablesApp() {
             favouritesCollapsed = favouritesCollapsed,
             uncategorizedCollapsed = uncategorizedCollapsed
         )
+    }
+
+    fun importOneScanable(imported: ImportedScanable) {
+        val categoryName = imported.categoryName?.trim().orEmpty()
+        val targetCategoryId = if (categoryName.isNotBlank()) {
+            val existingCategory = categories.firstOrNull { it.name.equals(categoryName, ignoreCase = true) }
+            if (existingCategory != null) {
+                existingCategory.id
+            } else {
+                val newCategory = ScanableCategory(
+                    name = categoryName,
+                    sortOrder = nextCategorySortOrder(categories)
+                )
+                categories.add(newCategory)
+                newCategory.id
+            }
+        } else {
+            null
+        }
+
+        items.add(
+            imported.item.copy(
+                id = UUID.randomUUID().toString(),
+                categoryId = targetCategoryId,
+                sortOrder = nextSortOrderForCategory(items, targetCategoryId),
+                createdAt = System.currentTimeMillis(),
+                updatedAt = System.currentTimeMillis()
+            )
+        )
+        saveAll()
+    }
+
+    fun exportBackupNow() {
+        val uri = saveTextExportToDocumentsScanables(
+            context = context,
+            fileName = "scanables-backup-${System.currentTimeMillis()}.json",
+            text = createScanablesBackupJson(
+                items = items.toList(),
+                categories = categories.toList(),
+                favouritesCollapsed = favouritesCollapsed,
+                uncategorizedCollapsed = uncategorizedCollapsed
+            )
+        )
+
+        if (uri == null) {
+            Toast.makeText(context, "Could not export scanables", Toast.LENGTH_SHORT).show()
+        } else {
+            Toast.makeText(context, "Saved to Documents/Scanables", Toast.LENGTH_SHORT).show()
+            shareExportedJson(context, uri, "Share Scanables backup")
+        }
+    }
+
+    val importBackupLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocument()
+    ) { uri: Uri? ->
+        if (uri != null) {
+            val backup = readTextFromUri(context, uri)?.let { parseScanablesBackupJson(it) }
+            if (backup == null) {
+                Toast.makeText(context, "Could not import backup", Toast.LENGTH_SHORT).show()
+            } else {
+                items.clear()
+                items.addAll(backup.items)
+                categories.clear()
+                categories.addAll(backup.categories)
+                favouritesCollapsed = backup.favouritesCollapsed
+                uncategorizedCollapsed = backup.uncategorizedCollapsed
+                saveAll()
+                Toast.makeText(context, "Backup imported", Toast.LENGTH_SHORT).show()
+            }
+        }
+    }
+
+    fun exportScanableNow(item: ScanableItem) {
+        val categoryName = categories.firstOrNull { it.id == item.categoryId }?.name
+        val uri = saveTextExportToDocumentsScanables(
+            context = context,
+            fileName = "scanable-${safeFileName(item.name)}-${System.currentTimeMillis()}.json",
+            text = createScanableExportJson(item, categoryName)
+        )
+
+        if (uri == null) {
+            Toast.makeText(context, "Could not export scanable", Toast.LENGTH_SHORT).show()
+        } else {
+            Toast.makeText(context, "Saved to Documents/Scanables", Toast.LENGTH_SHORT).show()
+            shareExportedJson(context, uri, "Share scanable")
+        }
+    }
+
+    val importScanableLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocument()
+    ) { uri: Uri? ->
+        if (uri != null) {
+            val imported = readTextFromUri(context, uri)?.let { parseScanableExportJson(it) }
+            if (imported == null) {
+                Toast.makeText(context, "Could not import scanable", Toast.LENGTH_SHORT).show()
+            } else {
+                importOneScanable(imported)
+                Toast.makeText(context, "Scanable imported", Toast.LENGTH_SHORT).show()
+            }
+        }
     }
 
     MaterialTheme(
@@ -259,6 +389,21 @@ fun ScanablesApp() {
                     onResetSwipeTutorial = {
                         showSwipeTutorial = true
                         ScanablesStore(context).resetSwipeTutorial()
+                    },
+                    onImportScanable = {
+                        importScanableLauncher.launch(arrayOf("application/json", "text/*", "*/*"))
+                    },
+                    onExportScanables = {
+                        exportBackupNow()
+                    },
+                    onImportScanables = {
+                        importBackupLauncher.launch(arrayOf("application/json", "text/*", "*/*"))
+                    },
+                    onShareItem = { item ->
+                        sharingItem = item
+                    },
+                    onExportItem = { item ->
+                        exportScanableNow(item)
                     },
                     onToggleFavourites = {
                         favouritesCollapsed = !favouritesCollapsed
@@ -365,10 +510,17 @@ fun ScanablesApp() {
                 AppScreen.Scanner -> ScannerScreen(
                     onBack = { screen = AppScreen.Home },
                     onScanned = { value, format ->
-                        pendingScannedValue = value to format
-                        editingItem = null
-                        showItemDialog = true
-                        screen = AppScreen.Home
+                        val imported = parseScanableExportJson(value)
+                        if (imported != null) {
+                            importOneScanable(imported)
+                            Toast.makeText(context, "Scanable imported", Toast.LENGTH_SHORT).show()
+                            screen = AppScreen.Home
+                        } else {
+                            pendingScannedValue = value to format
+                            editingItem = null
+                            showItemDialog = true
+                            screen = AppScreen.Home
+                        }
                     }
                 )
 
@@ -434,6 +586,17 @@ fun ScanablesApp() {
                     }
                 )
             }
+
+            sharingItem?.let { item ->
+                ShareScanableDialog(
+                    item = item,
+                    categoryName = categories.firstOrNull { it.id == item.categoryId }?.name,
+                    onDismiss = { sharingItem = null },
+                    onExport = {
+                        exportScanableNow(item)
+                    }
+                )
+            }
         }
     }
 }
@@ -454,6 +617,11 @@ fun ScanablesHomeScreen(
     showSwipeTutorial: Boolean,
     onDismissSwipeTutorial: () -> Unit,
     onResetSwipeTutorial: () -> Unit,
+    onImportScanable: () -> Unit,
+    onExportScanables: () -> Unit,
+    onImportScanables: () -> Unit,
+    onShareItem: (ScanableItem) -> Unit,
+    onExportItem: (ScanableItem) -> Unit,
     onToggleFavourites: () -> Unit,
     onToggleUncategorized: () -> Unit,
     onToggleCategory: (ScanableCategory) -> Unit,
@@ -474,6 +642,52 @@ fun ScanablesHomeScreen(
     var addMenuOpen by remember { mutableStateOf(false) }
     var appMenuOpen by remember { mutableStateOf(false) }
     var showAboutDialog by remember { mutableStateOf(false) }
+    var showSettingsDialog by remember { mutableStateOf(false) }
+    var onboardingStep by remember(showSwipeTutorial) { mutableStateOf(0) }
+    var searchVisible by remember { mutableStateOf(false) }
+    var searchFocused by remember { mutableStateOf(false) }
+    var searchQuery by remember { mutableStateOf("") }
+
+    val focusManager = LocalFocusManager.current
+    val keyboardController = LocalSoftwareKeyboardController.current
+    val searchFocusRequester = remember { FocusRequester() }
+
+    fun closeSearch(clearQuery: Boolean = false) {
+        focusManager.clearFocus()
+        keyboardController?.hide()
+        searchFocused = false
+        if (clearQuery) searchQuery = ""
+        if (searchQuery.isBlank() || clearQuery) searchVisible = false
+    }
+
+    LaunchedEffect(searchVisible) {
+        if (searchVisible) {
+            searchFocusRequester.requestFocus()
+            keyboardController?.show()
+        }
+    }
+
+    val trimmedSearchQuery = searchQuery.trim()
+    val visibleScanables = if (trimmedSearchQuery.isBlank()) {
+        scanables
+    } else {
+        val tokens = trimmedSearchQuery
+            .lowercase()
+            .split(Regex("\\s+"))
+            .filter { it.isNotBlank() }
+
+        scanables.filter { item ->
+            val categoryName = categories.firstOrNull { it.id == item.categoryId }?.name.orEmpty()
+            val haystack = listOf(
+                item.name,
+                item.rawValue,
+                item.format.name,
+                categoryName
+            ).joinToString(" ").lowercase()
+
+            tokens.all { token -> haystack.contains(token) }
+        }
+    }
 
     var dropBounds by remember { mutableStateOf<Map<String, Rect>>(emptyMap()) }
     var hoveredDropTargetId by remember { mutableStateOf<String?>(null) }
@@ -495,6 +709,10 @@ fun ScanablesHomeScreen(
     val edgeScrollZonePx = with(density) { 120.dp.toPx() }
     val maxAutoScrollVelocityPxPerSecond = with(density) { 720.dp.toPx() }
     var autoScrollVelocityPxPerSecond by remember { mutableStateOf(0f) }
+
+    BackHandler(enabled = searchVisible || searchQuery.isNotBlank()) {
+        closeSearch(clearQuery = true)
+    }
 
     fun applyHoveredDropTarget(pointer: Offset) {
         if (draggingFromFavourites) {
@@ -632,6 +850,13 @@ fun ScanablesHomeScreen(
     Box(
         modifier = Modifier
             .fillMaxSize()
+            .pointerInput(searchVisible, searchQuery) {
+                detectTapGestures {
+                    if (searchFocused || searchQuery.isNotBlank()) {
+                        closeSearch(clearQuery = false)
+                    }
+                }
+            }
             .onGloballyPositioned { coordinates ->
                 rootBounds = coordinates.boundsInRoot()
             }
@@ -646,6 +871,10 @@ fun ScanablesHomeScreen(
                         )
                     },
                     actions = {
+                        IconButton(onClick = { searchVisible = true }) {
+                            Icon(Icons.Default.Search, contentDescription = "Search")
+                        }
+
                         Box {
                             IconButton(onClick = { appMenuOpen = true }) {
                                 Icon(Icons.Default.MoreVert, contentDescription = "More options")
@@ -656,10 +885,10 @@ fun ScanablesHomeScreen(
                                 onDismissRequest = { appMenuOpen = false }
                             ) {
                                 DropdownMenuItem(
-                                    text = { Text("Show swipe tip") },
+                                    text = { Text("Settings") },
                                     onClick = {
                                         appMenuOpen = false
-                                        onResetSwipeTutorial()
+                                        showSettingsDialog = true
                                     }
                                 )
 
@@ -690,7 +919,7 @@ fun ScanablesHomeScreen(
                         onDismissRequest = { addMenuOpen = false }
                     ) {
                         DropdownMenuItem(
-                            text = { Text("Scan barcode / QR") },
+                            text = { Text("Scan scanable") },
                             leadingIcon = { Icon(Icons.Default.QrCodeScanner, contentDescription = null) },
                             onClick = {
                                 addMenuOpen = false
@@ -703,6 +932,14 @@ fun ScanablesHomeScreen(
                             onClick = {
                                 addMenuOpen = false
                                 onAddManual()
+                            }
+                        )
+
+                        DropdownMenuItem(
+                            text = { Text("Import scanable") },
+                            onClick = {
+                                addMenuOpen = false
+                                onImportScanable()
                             }
                         )
 
@@ -727,8 +964,32 @@ fun ScanablesHomeScreen(
             ) {
                 item { Spacer(Modifier.height(4.dp)) }
 
+                if (searchVisible || searchQuery.isNotBlank()) {
+                    item {
+                        OutlinedTextField(
+                            value = searchQuery,
+                            onValueChange = { searchQuery = it },
+                            label = { Text("Search") },
+                            placeholder = { Text("Search scanables") },
+                            leadingIcon = {
+                                Icon(Icons.Default.Search, contentDescription = null)
+                            },
+                            trailingIcon = {
+                                IconButton(onClick = { closeSearch(clearQuery = true) }) {
+                                    Icon(Icons.Default.Close, contentDescription = "Close search")
+                                }
+                            },
+                            singleLine = true,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .focusRequester(searchFocusRequester)
+                                .onFocusChanged { searchFocused = it.isFocused }
+                        )
+                    }
+                }
+
                 item {
-                    val favouriteItems = scanables.filter { it.isFavourite }
+                    val favouriteItems = visibleScanables.filter { it.isFavourite }
 
                     ScanableSection(
                         title = "Favourites",
@@ -743,7 +1004,7 @@ fun ScanablesHomeScreen(
                         }
                     ) {
                         if (favouriteItems.isEmpty()) {
-                            EmptySectionText("Favourite scanables for quick access.")
+                            EmptySectionText(if (trimmedSearchQuery.isBlank()) "Favourite scanables for quick access." else "No matching favourites.")
                         } else {
                             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                                 favouriteItems.forEach { item ->
@@ -752,6 +1013,8 @@ fun ScanablesHomeScreen(
                                         onClick = { onDisplayItem(item) },
                                         onEdit = { onEditItem(item) },
                                         onDelete = { onDeleteItem(item) },
+                                        onShare = { onShareItem(item) },
+                                        onExport = { onExportItem(item) },
                                         onToggleFavourite = { onToggleFavourite(item) },
                                         onMoveUp = { onMoveItem(item, -1) },
                                         onMoveDown = { onMoveItem(item, 1) },
@@ -788,7 +1051,7 @@ fun ScanablesHomeScreen(
                 }
 
                 item {
-                    val uncategorizedItems = scanables.filter { it.categoryId == null }
+                    val uncategorizedItems = visibleScanables.filter { it.categoryId == null }
 
                     ScanableSection(
                         title = "Uncategorized",
@@ -803,7 +1066,7 @@ fun ScanablesHomeScreen(
                         }
                     ) {
                         if (uncategorizedItems.isEmpty()) {
-                            EmptySectionText("New scanables without a category appear here.")
+                            EmptySectionText(if (trimmedSearchQuery.isBlank()) "New scanables without a category appear here." else "No matching uncategorized scanables.")
                         } else {
                             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                                 uncategorizedItems.forEach { item ->
@@ -812,6 +1075,8 @@ fun ScanablesHomeScreen(
                                         onClick = { onDisplayItem(item) },
                                         onEdit = { onEditItem(item) },
                                         onDelete = { onDeleteItem(item) },
+                                        onShare = { onShareItem(item) },
+                                        onExport = { onExportItem(item) },
                                         onToggleFavourite = { onToggleFavourite(item) },
                                         onMoveUp = { onMoveItem(item, -1) },
                                         onMoveDown = { onMoveItem(item, 1) },
@@ -870,7 +1135,7 @@ fun ScanablesHomeScreen(
                 }
 
                 items(categories, key = { it.id }) { category ->
-                    val categoryItems = scanables.filter { it.categoryId == category.id }
+                    val categoryItems = visibleScanables.filter { it.categoryId == category.id }
 
                     ScanableSection(
                         title = category.name,
@@ -891,7 +1156,7 @@ fun ScanablesHomeScreen(
                         }
                     ) {
                         if (categoryItems.isEmpty()) {
-                            EmptySectionText("No scanables in this category yet.")
+                            EmptySectionText(if (trimmedSearchQuery.isBlank()) "No scanables in this category yet." else "No matching scanables in this category.")
                         } else {
                             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                                 categoryItems.forEach { item ->
@@ -900,6 +1165,8 @@ fun ScanablesHomeScreen(
                                         onClick = { onDisplayItem(item) },
                                         onEdit = { onEditItem(item) },
                                         onDelete = { onDeleteItem(item) },
+                                        onShare = { onShareItem(item) },
+                                        onExport = { onExportItem(item) },
                                         onToggleFavourite = { onToggleFavourite(item) },
                                         onMoveUp = { onMoveItem(item, -1) },
                                         onMoveDown = { onMoveItem(item, 1) },
@@ -951,8 +1218,30 @@ fun ScanablesHomeScreen(
         AboutScanablesDialog(onDismiss = { showAboutDialog = false })
     }
 
+    if (showSettingsDialog) {
+        SettingsDialog(
+            onDismiss = { showSettingsDialog = false },
+            onExportScanables = onExportScanables,
+            onImportScanables = onImportScanables,
+            onShowTutorial = onResetSwipeTutorial
+        )
+    }
+
     if (showSwipeTutorial) {
-        SwipeTutorialDialog(onDismiss = onDismissSwipeTutorial)
+        OnboardingTutorialDialog(
+            step = onboardingStep,
+            onBack = {
+                onboardingStep = (onboardingStep - 1).coerceAtLeast(0)
+            },
+            onNext = {
+                if (onboardingStep < 5) {
+                    onboardingStep += 1
+                } else {
+                    onDismissSwipeTutorial()
+                }
+            },
+            onDismiss = onDismissSwipeTutorial
+        )
     }
 }
 
@@ -1083,6 +1372,8 @@ fun ScanableCard(
     onClick: () -> Unit,
     onEdit: () -> Unit,
     onDelete: () -> Unit,
+    onShare: () -> Unit,
+    onExport: () -> Unit,
     onToggleFavourite: () -> Unit,
     onMoveUp: () -> Unit,
     onMoveDown: () -> Unit,
@@ -1216,6 +1507,8 @@ fun ScanableCard(
                 onMenuOpenChange = { menuOpen = it },
                 onEdit = onEdit,
                 onDelete = onDelete,
+                onShare = onShare,
+                onExport = onExport,
                 onToggleFavourite = onToggleFavourite,
                 showMenu = true
             )
@@ -1253,6 +1546,8 @@ fun FloatingScanableCard(state: DragPreviewState) {
             onMenuOpenChange = {},
             onEdit = {},
             onDelete = {},
+            onShare = {},
+            onExport = {},
             onToggleFavourite = {},
             showMenu = false
         )
@@ -1266,6 +1561,8 @@ fun ScanableCardRow(
     onMenuOpenChange: (Boolean) -> Unit,
     onEdit: () -> Unit,
     onDelete: () -> Unit,
+    onShare: () -> Unit,
+    onExport: () -> Unit,
     onToggleFavourite: () -> Unit,
     showMenu: Boolean
 ) {
@@ -1332,6 +1629,13 @@ fun ScanableCardRow(
                         }
                     )
                     DropdownMenuItem(
+                        text = { Text("Share") },
+                        onClick = {
+                            onMenuOpenChange(false)
+                            onShare()
+                        }
+                    )
+                    DropdownMenuItem(
                         text = { Text("Delete") },
                         onClick = {
                             onMenuOpenChange(false)
@@ -1343,6 +1647,172 @@ fun ScanableCardRow(
         }
     }
 }
+
+fun writeTextToUri(context: Context, uri: Uri, text: String) {
+    context.contentResolver.openOutputStream(uri)?.use { stream ->
+        stream.write(text.toByteArray(Charsets.UTF_8))
+    }
+}
+
+fun readTextFromUri(context: Context, uri: Uri): String? =
+    context.contentResolver.openInputStream(uri)?.bufferedReader(Charsets.UTF_8)?.use { it.readText() }
+
+fun saveTextExportToDocumentsScanables(
+    context: Context,
+    fileName: String,
+    text: String
+): Uri? {
+    return try {
+        val values = ContentValues().apply {
+            put(MediaStore.MediaColumns.DISPLAY_NAME, fileName)
+            put(MediaStore.MediaColumns.MIME_TYPE, "application/json")
+            put(
+                MediaStore.MediaColumns.RELATIVE_PATH,
+                Environment.DIRECTORY_DOCUMENTS + "/Scanables"
+            )
+        }
+
+        val uri = context.contentResolver.insert(
+            MediaStore.Files.getContentUri("external"),
+            values
+        ) ?: return null
+
+        context.contentResolver.openOutputStream(uri)?.use { stream ->
+            stream.write(text.toByteArray(Charsets.UTF_8))
+        } ?: return null
+
+        uri
+    } catch (_: Exception) {
+        null
+    }
+}
+
+fun shareExportedJson(context: Context, uri: Uri, title: String) {
+    val intent = Intent(Intent.ACTION_SEND).apply {
+        type = "application/json"
+        putExtra(Intent.EXTRA_STREAM, uri)
+        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+    }
+
+    context.startActivity(Intent.createChooser(intent, title))
+}
+
+fun safeFileName(name: String): String {
+    val cleaned = name
+        .lowercase()
+        .replace(Regex("[^a-z0-9-_]+"), "-")
+        .trim('-')
+    return cleaned.ifBlank { "scanable" }
+}
+
+fun createScanableExportJson(item: ScanableItem, categoryName: String?): String =
+    JSONObject()
+        .put("type", JSON_TYPE_SCANABLE)
+        .put("version", 1)
+        .put("categoryName", categoryName ?: "")
+        .put(
+            "item",
+            JSONObject()
+                .put("name", item.name)
+                .put("rawValue", item.rawValue)
+                .put("format", item.format.name)
+                .put("isFavourite", item.isFavourite)
+                .put("sortOrder", item.sortOrder)
+                .put("createdAt", item.createdAt)
+                .put("updatedAt", item.updatedAt)
+        )
+        .toString()
+
+fun parseScanableExportJson(json: String): ImportedScanable? = try {
+    val root = JSONObject(json)
+    if (root.optString("type") != JSON_TYPE_SCANABLE) {
+        null
+    } else {
+        val obj = root.getJSONObject("item")
+        ImportedScanable(
+            item = ScanableItem(
+                name = obj.getString("name"),
+                rawValue = obj.getString("rawValue"),
+                format = obj.optString("format").toScanableFormat(),
+                categoryId = null,
+                isFavourite = obj.optBoolean("isFavourite", false),
+                sortOrder = obj.optInt("sortOrder", 0),
+                createdAt = obj.optLong("createdAt", System.currentTimeMillis()),
+                updatedAt = obj.optLong("updatedAt", System.currentTimeMillis())
+            ),
+            categoryName = root.optString("categoryName").takeIf { it.isNotBlank() }
+        )
+    }
+} catch (_: Exception) {
+    null
+}
+
+fun createScanablesBackupJson(
+    items: List<ScanableItem>,
+    categories: List<ScanableCategory>,
+    favouritesCollapsed: Boolean,
+    uncategorizedCollapsed: Boolean
+): String =
+    JSONObject()
+        .put("type", JSON_TYPE_BACKUP)
+        .put("version", 1)
+        .put("items", items.scanableItemsToJson())
+        .put("categories", categories.scanableCategoriesToJson())
+        .put("favouritesCollapsed", favouritesCollapsed)
+        .put("uncategorizedCollapsed", uncategorizedCollapsed)
+        .toString()
+
+fun parseScanablesBackupJson(json: String): ScanablesBackup? = try {
+    val root = JSONObject(json)
+    if (root.optString("type") != JSON_TYPE_BACKUP) {
+        null
+    } else {
+        ScanablesBackup(
+            items = root.getJSONArray("items").toScanableItems(),
+            categories = root.getJSONArray("categories").toScanableCategories(),
+            favouritesCollapsed = root.optBoolean("favouritesCollapsed", false),
+            uncategorizedCollapsed = root.optBoolean("uncategorizedCollapsed", false)
+        )
+    }
+} catch (_: Exception) {
+    null
+}
+
+fun JSONArray.toScanableItems(): List<ScanableItem> = buildList {
+    for (i in 0 until length()) {
+        val obj = getJSONObject(i)
+        add(
+            ScanableItem(
+                id = obj.optString("id").takeIf { it.isNotBlank() } ?: UUID.randomUUID().toString(),
+                name = obj.getString("name"),
+                rawValue = obj.getString("rawValue"),
+                format = obj.optString("format").toScanableFormat(),
+                categoryId = obj.optString("categoryId").takeIf { it.isNotBlank() },
+                isFavourite = obj.optBoolean("isFavourite"),
+                sortOrder = obj.optInt("sortOrder"),
+                createdAt = obj.optLong("createdAt"),
+                updatedAt = obj.optLong("updatedAt")
+            )
+        )
+    }
+}
+
+fun JSONArray.toScanableCategories(): List<ScanableCategory> = buildList {
+    for (i in 0 until length()) {
+        val obj = getJSONObject(i)
+        add(
+            ScanableCategory(
+                id = obj.optString("id").takeIf { it.isNotBlank() } ?: UUID.randomUUID().toString(),
+                name = obj.getString("name"),
+                sortOrder = obj.optInt("sortOrder"),
+                isCollapsed = obj.optBoolean("isCollapsed"),
+                createdAt = obj.optLong("createdAt"),
+                updatedAt = obj.optLong("updatedAt")
+            )
+        )
+    }
+}
+
 
 fun inferScanableFormat(value: String): ScanableFormat {
     val cleaned = value.trim()
@@ -1375,7 +1845,54 @@ fun EmptySectionText(text: String) {
 }
 
 @Composable
-fun SwipeTutorialDialog(onDismiss: () -> Unit) {
+fun OnboardingTutorialDialog(
+    step: Int,
+    onBack: () -> Unit,
+    onNext: () -> Unit,
+    onDismiss: () -> Unit
+) {
+    val title: String
+    val body: String
+    val icon: String
+
+    when (step) {
+        0 -> {
+            icon = "▣"
+            title = "Welcome to Scanables"
+            body = "Save barcodes and QR codes, then tap a scanable to display it when you need it."
+        }
+
+        1 -> {
+            icon = "★"
+            title = "Favourites"
+            body = "Press the star, or drag a scanable into Favourites, to keep it at the top for quick access."
+        }
+
+        2 -> {
+            icon = "+"
+            title = "Categories"
+            body = "Create categories to group your scanables. Use the plus button, then choose New category."
+        }
+
+        3 -> {
+            icon = "↕"
+            title = "Drag to organise"
+            body = "Long-press and drag a scanable over a category. Release when the category highlights."
+        }
+
+        4 -> {
+            icon = "→"
+            title = "Swipe to edit"
+            body = "Swipe a scanable to the right to edit its name, value, category, favourite state, or advanced format."
+        }
+
+        else -> {
+            icon = "←"
+            title = "Swipe to delete"
+            body = "Swipe a scanable to the left to delete it. You can reopen this tutorial from the three-dot menu."
+        }
+    }
+
     AlertDialog(
         onDismissRequest = onDismiss,
         shape = RoundedCornerShape(28.dp),
@@ -1384,62 +1901,197 @@ fun SwipeTutorialDialog(onDismiss: () -> Unit) {
         textContentColor = Color.White,
         title = {
             Text(
-                text = "Scanables gestures",
+                text = title,
                 fontWeight = FontWeight.Bold
             )
         },
         text = {
-            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+            Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Box(
                         modifier = Modifier
-                            .size(42.dp)
-                            .background(Color(0xFF202532), RoundedCornerShape(14.dp)),
+                            .size(46.dp)
+                            .background(Color(0xFF202532), RoundedCornerShape(16.dp)),
                         contentAlignment = Alignment.Center
                     ) {
-                        Text("↔", color = Color(0xFF58C7F3), fontWeight = FontWeight.Bold)
-                    }
-                    Spacer(Modifier.width(12.dp))
-                    Column(Modifier.weight(1f)) {
-                        Text("Swipe actions", fontWeight = FontWeight.Bold)
                         Text(
-                            "Swipe right to edit. Swipe left to delete.",
-                            color = Color(0xFFB9C2CC),
-                            style = MaterialTheme.typography.bodySmall
+                            text = icon,
+                            color = Color(0xFF58C7F3),
+                            fontWeight = FontWeight.Bold
                         )
                     }
-                }
 
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Box(
-                        modifier = Modifier
-                            .size(42.dp)
-                            .background(Color(0xFF202532), RoundedCornerShape(14.dp)),
-                        contentAlignment = Alignment.Center
-                    ) {
-                        Text("↕", color = Color(0xFF58C7F3), fontWeight = FontWeight.Bold)
-                    }
                     Spacer(Modifier.width(12.dp))
-                    Column(Modifier.weight(1f)) {
-                        Text("Drag to organise", fontWeight = FontWeight.Bold)
-                        Text(
-                            "Long-press and drag a scanable over a category. Release when the category highlights.",
-                            color = Color(0xFFB9C2CC),
-                            style = MaterialTheme.typography.bodySmall
-                        )
-                    }
+
+                    Text(
+                        text = body,
+                        color = Color(0xFFE7EDF4),
+                        style = MaterialTheme.typography.bodyMedium,
+                        modifier = Modifier.weight(1f)
+                    )
                 }
 
                 Text(
-                    "Dragging onto Favourites adds quick access without moving the scanable from its category.",
+                    text = "Step ${step + 1} of 6",
                     color = Color(0xFFB9C2CC),
                     style = MaterialTheme.typography.bodySmall
                 )
             }
         },
         confirmButton = {
+            Button(onClick = onNext) {
+                Text(if (step == 5) "Finish" else "Next")
+            }
+        },
+        dismissButton = {
+            Row {
+                if (step > 0) {
+                    TextButton(onClick = onBack) {
+                        Text("Back")
+                    }
+                }
+
+                TextButton(onClick = onDismiss) {
+                    Text("Skip")
+                }
+            }
+        }
+    )
+}
+
+@Composable
+fun SettingsDialog(
+    onDismiss: () -> Unit,
+    onExportScanables: () -> Unit,
+    onImportScanables: () -> Unit,
+    onShowTutorial: () -> Unit
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        shape = RoundedCornerShape(28.dp),
+        containerColor = Color(0xFF171A22),
+        titleContentColor = Color.White,
+        textContentColor = Color.White,
+        title = {
+            Text(
+                text = "Settings",
+                fontWeight = FontWeight.Bold
+            )
+        },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                OutlinedButton(
+                    onClick = {
+                        onDismiss()
+                        onExportScanables()
+                    },
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text("Export scanables")
+                }
+
+                OutlinedButton(
+                    onClick = {
+                        onDismiss()
+                        onImportScanables()
+                    },
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text("Import scanables")
+                }
+
+                Text(
+                    text = "Importing a backup replaces the current scanables and categories on this device.",
+                    color = Color(0xFFB9C2CC),
+                    style = MaterialTheme.typography.bodySmall
+                )
+
+                Divider(color = Color(0xFF252A32))
+
+                OutlinedButton(
+                    onClick = {
+                        onDismiss()
+                        onShowTutorial()
+                    },
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text("Show tutorial")
+                }
+            }
+        },
+        confirmButton = {
             TextButton(onClick = onDismiss) {
-                Text("Got it")
+                Text("Close")
+            }
+        }
+    )
+}
+
+@Composable
+fun ShareScanableDialog(
+    item: ScanableItem,
+    categoryName: String?,
+    onDismiss: () -> Unit,
+    onExport: () -> Unit
+) {
+    val shareJson = remember(item, categoryName) { createScanableExportJson(item, categoryName) }
+    val qrBitmap = remember(shareJson) { createBarcodeBitmap(shareJson, ScanableFormat.QR_CODE) }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        shape = RoundedCornerShape(28.dp),
+        containerColor = Color(0xFF171A22),
+        titleContentColor = Color.White,
+        textContentColor = Color.White,
+        title = {
+            Text(
+                text = "Share scanable",
+                fontWeight = FontWeight.Bold
+            )
+        },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                Text(
+                    text = item.name,
+                    fontWeight = FontWeight.Bold
+                )
+
+                if (qrBitmap != null) {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .background(Color.White, RoundedCornerShape(22.dp))
+                            .padding(16.dp),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Image(
+                            bitmap = qrBitmap.asImageBitmap(),
+                            contentDescription = "Share ${item.name}",
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                    }
+                } else {
+                    Text(
+                        text = "This scanable is too large to share as a QR code. Export it instead.",
+                        color = Color(0xFFB9C2CC)
+                    )
+                }
+
+                Text(
+                    text = "Scan this QR code with Scanables to import this card.",
+                    color = Color(0xFFB9C2CC),
+                    style = MaterialTheme.typography.bodySmall
+                )
+            }
+        },
+        confirmButton = {
+            Button(onClick = onExport) {
+                Text("Export")
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) {
+                Text("Close")
             }
         }
     )
@@ -1473,7 +2125,7 @@ fun AboutScanablesDialog(onDismiss: () -> Unit) {
                 )
 
                 Text(
-                    text = "Scanables V1.0",
+                    text = "Scanables V1.1",
                     color = Color(0xFFB9C2CC),
                     style = MaterialTheme.typography.bodySmall
                 )
@@ -2100,7 +2752,7 @@ class ScanablesStore(private val context: Context) {
     private val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
 
     fun loadItems(): List<ScanableItem> {
-        val json = prefs.getString(KEY_ITEMS, null) ?: return sampleItems()
+        val json = prefs.getString(KEY_ITEMS, null) ?: return emptyList()
 
         return try {
             val array = JSONArray(json)
@@ -2125,12 +2777,12 @@ class ScanablesStore(private val context: Context) {
                 }
             }
         } catch (_: Exception) {
-            sampleItems()
+            emptyList()
         }
     }
 
     fun loadCategories(): List<ScanableCategory> {
-        val json = prefs.getString(KEY_CATEGORIES, null) ?: return sampleCategories()
+        val json = prefs.getString(KEY_CATEGORIES, null) ?: return emptyList()
 
         return try {
             val array = JSONArray(json)
@@ -2152,7 +2804,7 @@ class ScanablesStore(private val context: Context) {
                 }
             }
         } catch (_: Exception) {
-            sampleCategories()
+            emptyList()
         }
     }
 
@@ -2163,17 +2815,19 @@ class ScanablesStore(private val context: Context) {
         prefs.getBoolean(KEY_UNCAT_COLLAPSED, false)
 
     fun shouldShowSwipeTutorial(): Boolean =
-        !prefs.getBoolean(KEY_SWIPE_TUTORIAL_SEEN, false)
+        !prefs.getBoolean(KEY_ONBOARDING_COMPLETE, false)
 
     fun markSwipeTutorialSeen() {
         prefs.edit()
             .putBoolean(KEY_SWIPE_TUTORIAL_SEEN, true)
+            .putBoolean(KEY_ONBOARDING_COMPLETE, true)
             .apply()
     }
 
     fun resetSwipeTutorial() {
         prefs.edit()
             .putBoolean(KEY_SWIPE_TUTORIAL_SEEN, false)
+            .putBoolean(KEY_ONBOARDING_COMPLETE, false)
             .apply()
     }
 
@@ -2226,29 +2880,9 @@ fun List<ScanableCategory>.scanableCategoriesToJson(): JSONArray = JSONArray().a
 fun String.toScanableFormat(): ScanableFormat =
     ScanableFormat.entries.firstOrNull { it.name == this } ?: ScanableFormat.QR_CODE
 
-fun sampleCategories(): List<ScanableCategory> = listOf(
-    ScanableCategory(id = "cat_everyday", name = "Everyday", sortOrder = 0),
-    ScanableCategory(id = "cat_saved", name = "Saved codes", sortOrder = 1)
-)
+fun sampleCategories(): List<ScanableCategory> = emptyList()
 
-fun sampleItems(): List<ScanableItem> = listOf(
-    ScanableItem(
-        name = "Example QR",
-        rawValue = "https://example.com",
-        format = ScanableFormat.QR_CODE,
-        categoryId = null,
-        isFavourite = true,
-        sortOrder = 0
-    ),
-    ScanableItem(
-        name = "Example barcode",
-        categoryId = "cat_saved",
-        rawValue = "123456789012",
-        format = ScanableFormat.CODE_128,
-        isFavourite = false,
-        sortOrder = 0
-    )
-)
+fun sampleItems(): List<ScanableItem> = emptyList()
 
 fun nextSortOrderForCategory(items: List<ScanableItem>, categoryId: String?): Int =
     (items.filter { it.categoryId == categoryId }.maxOfOrNull { it.sortOrder } ?: -1) + 1
