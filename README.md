@@ -1,34 +1,53 @@
 # Scanables
 
-Scanables is a Kotlin + Jetpack Compose Android app for saving, organising, and quickly displaying barcodes and QR codes.
+Scanables is a simple Android app for saving, organising, and displaying barcodes and QR codes.
 
-## Current beta features
+It is designed for quick access to codes you use often, with categories, favourites, swipe actions, and drag-and-drop organisation.
 
-- Dark Compose UI
-- Favourites section pinned at the top
-- Uncategorized section under favourites
-- Custom categories below that
-- Collapsible sections with saved collapsed state
-- Add / edit / delete scanables
-- Add / rename / delete categories
-- Move categories up/down
-- Move scanables up/down inside their category
-- Favourite/unfavourite scanables
-- Camera scanning with ML Kit + CameraX
-- Barcode / QR display with ZXing generation
-- Local persistence using SharedPreferences JSON
-- Android Auto Backup enabled for the app's saved preferences
-- Scanables logo included as the app icon/resource
+## Features
 
-## Notes
+- Save barcodes and QR codes
+- Add scanables by camera scan or manual entry
+- Automatically detects common barcode formats
+- Organise scanables into collapsible categories
+- Favourites section for quick access
+- Uncategorized section for new scanables
+- Drag scanables between categories
+- Drag onto Favourites to add quick access
+- Drag out of Favourites to remove quick access
+- Swipe right to edit
+- Swipe left to delete
+- Display saved codes full-screen for scanning
+- Screen brightness boost when displaying a code
+- Local on-device storage
+- Gesture tutorial
+- About screen
 
-This is a working beta, deliberately kept lean. True drag-and-drop is not wired yet; move up/down controls are included so ordering is already functional and the data model is ready for proper drag handles later.
+## Version
 
-## Open in Android Studio
+Scanables V1.0
 
-1. Extract the zip.
-2. Open the `ScanablesBeta` folder in Android Studio.
-3. Let Gradle sync.
-4. Run the `app` configuration on a real Android phone for camera scanning.
+## Built With
 
-The scanner needs a real device camera; emulators may not behave nicely unless a camera is configured.
+- Kotlin
+- Jetpack Compose
+- Material 3
+- CameraX
+- ML Kit Barcode Scanning
+- ZXing
+
+## Privacy
+
+Scanables stores saved scanables locally on the device.
+
+The app does not require an account and does not upload saved scanables to a server.
+
+Camera access is used only for scanning barcodes and QR codes.
+
+## Credits
+
+Made by Saf and Nyxen.
+
+## License
+
+No license has been added yet.
