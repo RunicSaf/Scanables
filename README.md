@@ -19,7 +19,6 @@ It is designed for quick access to codes you use often, with categories, favouri
 - Swipe right to edit
 - Swipe left to delete
 - Display saved codes full-screen for scanning
-- Screen brightness boost when displaying a code
 - Share individual scanables by QR code
 - Export individual scanables
 - Import shared scanables
